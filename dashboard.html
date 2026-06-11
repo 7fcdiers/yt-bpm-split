@@ -202,13 +202,15 @@
     const header = lines.shift().split(";");
     const idx = (name) => header.indexOf(name);
     const iId = idx("videoId"), iA = idx("artiste"), iT = idx("titre"),
-          iN = idx("bpm_normalise"), iM = idx("match_deezer");
+          iN = idx("bpm_normalise"), iM = idx("match_deezer"),
+          iF = idx("replie"), iS = idx("source");
     if (iA < 0 || iN < 0) { alert("CSV non reconnu : il faut le report.csv du script."); return; }
     tracks = lines.map(l => {
       const c = l.split(";");
       const bpm = c[iN] ? parseFloat(c[iN].replace(",", ".")) : null;
       return { videoId: c[iId] ?? "", artiste: c[iA] ?? "", titre: c[iT] ?? "",
-               bpm: Number.isFinite(bpm) ? bpm : null, match: c[iM] ?? "" };
+               bpm: Number.isFinite(bpm) ? bpm : null, match: c[iM] ?? "",
+               folded: iF >= 0 && c[iF] === "oui", source: iS >= 0 ? (c[iS] ?? "") : "" };
     });
     dz.style.display = "none";
     $("#dash").style.display = "block";
@@ -317,7 +319,7 @@
       return `<tr>
         <td>${esc(t.artiste)}</td>
         <td>${esc(t.titre)}</td>
-        <td class="bpm mono">${t.bpm ?? "—"}</td>
+        <td class="bpm mono" title="${t.folded ? "BPM replié (×2 ou ÷2) — à vérifier" : ""}${t.source ? " · source: " + esc(t.source) : ""}">${t.bpm ?? "—"}${t.folded ? ' <span style="color:#E04E1A" aria-label="replié">⚠</span>' : ""}</td>
         <td><span class="badge ${cls}">${lbl}</span></td>
         <td class="match" title="${esc(t.match)}">${esc(t.match) || "—"}</td>
         <td>${t.videoId ? `<a class="yt" href="https://music.youtube.com/watch?v=${esc(t.videoId)}" target="_blank" rel="noopener">écouter ↗</a>` : ""}</td>

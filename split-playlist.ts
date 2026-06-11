@@ -50,8 +50,9 @@ interface Track {
 }
 
 interface BpmEntry {
-  bpm: number | null; // null = non trouvé sur Deezer
+  bpm: number | null; // null = non trouvé
   matchedAs?: string;
+  source?: "deezer" | "getsongbpm" | "override";
 }
 
 interface State {
@@ -103,20 +104,50 @@ function parseTrack(item: youtube_v3.Schema$PlaylistItem): Track | null {
 }
 
 /**
- * Normalise le BPM dans une plage "running" [100, 200[.
- * Un titre à 75 BPM est ressenti à 150 en course → on double.
+ * Normalise le BPM dans une plage "cadence de course" [100, 200[.
+ *
+ * Pourquoi : en course, sur un titre à 75 BPM musical, on pose un pas sur
+ * chaque demi-temps → cadence ressentie de 150 pas/min. Mais c'est une
+ * heuristique : certains morceaux lents restent "lents" même doublés.
+ * D'où :
+ *   - NORMALIZE=off pour désactiver (classement sur le BPM brut)
+ *   - les titres "repliés" (×2 ou ÷2) sont marqués dans le rapport pour
+ *     arbitrage manuel via overrides.csv
  */
+const NORMALIZE = (process.env.NORMALIZE ?? "cadence") !== "off";
+
 function normalizeBpm(bpm: number): number {
+  if (!NORMALIZE) return Math.round(bpm * 10) / 10;
   let b = bpm;
   while (b < 100) b *= 2;
   while (b >= 200) b /= 2;
   return Math.round(b * 10) / 10;
 }
 
+const isFolded = (bpm: number) => NORMALIZE && (bpm < 100 || bpm >= 200);
+
 // ---------------------------------------------------------------------------
-// Deezer
+// Sources BPM : overrides.csv > Deezer > GetSongBPM
 // ---------------------------------------------------------------------------
 
+/** overrides.csv (optionnel) : lignes "videoId;bpm" — prioritaire sur tout. */
+function loadOverrides(): Record<string, number> {
+  const path = join(process.cwd(), "overrides.csv");
+  if (!existsSync(path)) return {};
+  const out: Record<string, number> = {};
+  for (const line of readFileSync(path, "utf8").trim().split(/\r?\n/)) {
+    const [id, bpm] = line.split(";");
+    const b = parseFloat((bpm ?? "").replace(",", "."));
+    if (id && !id.startsWith("videoId") && Number.isFinite(b) && b > 0) out[id.trim()] = b;
+  }
+  return out;
+}
+
+/**
+ * Deezer renvoie souvent bpm=0 même sur un bon match.
+ * → on scanne jusqu'à 5 candidats par requête au lieu du seul premier,
+ *   et on prend le premier dont le BPM est renseigné.
+ */
 async function deezerBpm(track: Track): Promise<BpmEntry> {
   const attempts = [
     `artist:"${track.artist}" track:"${track.title}"`,
@@ -126,24 +157,65 @@ async function deezerBpm(track: Track): Promise<BpmEntry> {
 
   for (const q of attempts) {
     try {
-      const res = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(q)}&limit=1`);
+      const res = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(q)}&limit=5`);
       const data = (await res.json()) as { data?: { id: number; title: string; artist: { name: string } }[] };
-      const hit = data.data?.[0];
       await sleep(DEEZER_DELAY_MS);
-      if (!hit) continue;
-
-      const trackRes = await fetch(`https://api.deezer.com/track/${hit.id}`);
-      const trackData = (await trackRes.json()) as { bpm?: number };
-      await sleep(DEEZER_DELAY_MS);
-
-      if (trackData.bpm && trackData.bpm > 0) {
-        return { bpm: trackData.bpm, matchedAs: `${hit.artist.name} - ${hit.title}` };
+      for (const hit of data.data ?? []) {
+        const trackRes = await fetch(`https://api.deezer.com/track/${hit.id}`);
+        const trackData = (await trackRes.json()) as { bpm?: number };
+        await sleep(DEEZER_DELAY_MS);
+        if (trackData.bpm && trackData.bpm > 0) {
+          return { bpm: trackData.bpm, matchedAs: `${hit.artist.name} - ${hit.title}`, source: "deezer" };
+        }
       }
     } catch {
       // réseau : on tente la requête suivante
     }
   }
   return { bpm: null };
+}
+
+/**
+ * Fallback GetSongBPM (https://getsongbpm.com/api) — clé gratuite,
+ * exige juste un backlink sur le site/projet qui l'utilise.
+ * Définir GETSONGBPM_KEY pour l'activer.
+ */
+const GETSONGBPM_KEY = process.env.GETSONGBPM_KEY ?? "";
+
+async function getSongBpm(track: Track): Promise<BpmEntry> {
+  if (!GETSONGBPM_KEY) return { bpm: null };
+  try {
+    const lookup = encodeURIComponent(`song:${track.title} artist:${track.artist}`);
+    const res = await fetch(
+      `https://api.getsong.co/search/?api_key=${GETSONGBPM_KEY}&type=both&lookup=${lookup}`
+    );
+    const data = (await res.json()) as {
+      search?: { tempo?: string; title?: string; artist?: { name?: string } }[];
+    };
+    await sleep(500); // limite GetSongBPM : rester poli
+    const hit = (Array.isArray(data.search) ? data.search : []).find(
+      (s) => s.tempo && parseFloat(s.tempo) > 0
+    );
+    if (hit) {
+      return {
+        bpm: parseFloat(hit.tempo!),
+        matchedAs: `${hit.artist?.name ?? "?"} - ${hit.title ?? "?"}`,
+        source: "getsongbpm",
+      };
+    }
+  } catch {
+    // fallback silencieux
+  }
+  return { bpm: null };
+}
+
+async function resolveBpm(track: Track, overrides: Record<string, number>): Promise<BpmEntry> {
+  if (overrides[track.videoId]) {
+    return { bpm: overrides[track.videoId], matchedAs: "override manuel", source: "override" };
+  }
+  const deezer = await deezerBpm(track);
+  if (deezer.bpm) return deezer;
+  return getSongBpm(track);
 }
 
 // ---------------------------------------------------------------------------
@@ -239,17 +311,23 @@ async function main() {
   const sourceMeta = await yt.playlists.list({ part: ["snippet"], id: [PLAYLIST_ID] });
   const sourceName = sourceMeta.data.items?.[0]?.snippet?.title ?? "Running";
 
-  // 2. BPM via Deezer (avec cache)
+  // 2. BPM multi-sources (avec cache ; les "non trouvés" sont retentés)
+  const overrides = loadOverrides();
+  if (Object.keys(overrides).length) console.log(`→ ${Object.keys(overrides).length} override(s) manuel(s) chargé(s).`);
   const cache = loadJson<Record<string, BpmEntry>>(CACHE_PATH, {});
   let done = 0;
   for (const t of tracks) {
-    if (!(t.videoId in cache)) {
-      cache[t.videoId] = await deezerBpm(t);
+    const cached = cache[t.videoId];
+    const overridden = overrides[t.videoId] !== undefined && cached?.source !== "override";
+    if (!cached || cached.bpm === null || overridden) {
+      cache[t.videoId] = await resolveBpm(t, overrides);
       saveJson(CACHE_PATH, cache);
     }
     done++;
     const e = cache[t.videoId];
-    const label = e.bpm ? `${e.bpm} BPM (norm. ${normalizeBpm(e.bpm)})` : "INTROUVABLE";
+    const label = e.bpm
+      ? `${e.bpm} BPM (norm. ${normalizeBpm(e.bpm)}${isFolded(e.bpm) ? " ⚠replié" : ""}) [${e.source}]`
+      : "INTROUVABLE";
     console.log(`  [${done}/${tracks.length}] ${t.artist} - ${t.title} → ${label}`);
   }
 
@@ -271,23 +349,26 @@ async function main() {
 
   // 4. Rapport CSV
   const csv = [
-    "videoId;artiste;titre;bpm_brut;bpm_normalise;playlist;match_deezer",
+    "videoId;artiste;titre;bpm_brut;bpm_normalise;replie;source;playlist;match_deezer",
     ...tracks.map((t) => {
       const e = cache[t.videoId];
       const norm = e.bpm ? normalizeBpm(e.bpm) : null;
       const dest = norm === null ? "NON TROUVÉ" : norm < BPM_THRESHOLD ? `<${BPM_THRESHOLD}` : `>=${BPM_THRESHOLD}`;
-      return `${t.videoId};${t.artist};${t.title};${e.bpm ?? ""};${norm ?? ""};${dest};${e.matchedAs ?? ""}`;
+      const folded = e.bpm && isFolded(e.bpm) ? "oui" : "";
+      return `${t.videoId};${t.artist};${t.title};${e.bpm ?? ""};${norm ?? ""};${folded};${e.source ?? ""};${dest};${e.matchedAs ?? ""}`;
     }),
   ].join("\n");
   writeFileSync(REPORT_PATH, csv);
   console.log(`✔ Rapport écrit : ${REPORT_PATH}`);
 
   // 5. Création des playlists + insertion (resumable)
+  // NB : l'API YouTube rejette les caractères "<" et ">" dans les titres ET
+  // descriptions de playlists (erreur 400 invalidPlaylistSnippet).
   const state = loadJson<State>(STATE_PATH, { inserted: [] });
   const slowId = await ensurePlaylist(yt, state, "slowPlaylistId",
-    `${sourceName} — Sous ${BPM_THRESHOLD} BPM`, `Générée automatiquement (BPM < ${BPM_THRESHOLD})`);
+    `${sourceName} — Sous ${BPM_THRESHOLD} BPM`, `Générée automatiquement (moins de ${BPM_THRESHOLD} BPM)`);
   const fastId = await ensurePlaylist(yt, state, "fastPlaylistId",
-    `${sourceName} — ${BPM_THRESHOLD} BPM et +`, `Générée automatiquement (BPM ≥ ${BPM_THRESHOLD})`);
+    `${sourceName} — ${BPM_THRESHOLD} BPM et +`, `Générée automatiquement (${BPM_THRESHOLD} BPM et plus)`);
 
   const jobs: [string, Track[]][] = [[slowId, slow], [fastId, fast]];
   for (const [playlistId, list] of jobs) {
